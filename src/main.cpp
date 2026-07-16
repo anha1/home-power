@@ -9,6 +9,8 @@
 #include <esp_task_wdt.h>
 #include <Adafruit_NeoPixel.h>
 #include <SilkyRMS.h>
+#include "EmonLib.h"                   // Include Emon Library
+EnergyMonitor emon1;   
 
 #include "/home/user/git/secrets/secrets.h" // Local credentials (ignored by Git)
 
@@ -92,9 +94,6 @@ void initOTA() {
 
 void setup() {
     Serial.begin(115200);
-
-    // Initialize the hardware pin and 12-bit resolution via the library
-    powerSensor.begin();
     
     pixel.begin();
     pixel.setBrightness(20); 
@@ -118,6 +117,13 @@ void setup() {
     }
     initOTA();
 
+    analogReadResolution(10);
+    emon1.current(4, 30); 
+
+    analogReadResolution(12);
+    // Initialize the hardware pin and 12-bit resolution via the library
+    powerSensor.begin();
+
     pixel.setPixelColor(0, pixel.Color(0, 255, 0));
     pixel.show();
 }
@@ -140,6 +146,11 @@ void loop() {
         pixel.setPixelColor(0, pixel.Color(r, g, b));
         pixel.show();
 
+        analogReadResolution(10);
+        double Irms = emon1.calcIrms(1480);  // Calculate Irms only
+        analogReadResolution(12);
+
+        send_statsd("esp32.power.legacy", Irms*230.0);
 
         // 4. Dispatch payloads
         send_statsd("esp32.power.watts", power_w);
