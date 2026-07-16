@@ -94,8 +94,7 @@ void setup() {
     Serial.begin(115200);
 
     // Initialize the hardware pin and 12-bit resolution via the library
-    powerSensor.begin();
-    
+
     pixel.begin();
     pixel.setBrightness(20); 
     pixel.setPixelColor(0, pixel.Color(255, 0, 0));
@@ -109,7 +108,6 @@ void setup() {
     esp_task_wdt_reconfigure(&twdt_config);
     esp_task_wdt_add(NULL);
 
-    powerSensor.calibrate_offset();
     esp_task_wdt_reset(); 
 
     WiFi.begin(ssid, password);
@@ -117,6 +115,12 @@ void setup() {
         delay(500);
     }
     initOTA();
+
+
+    esp_task_wdt_reset(); 
+    powerSensor.begin();
+    powerSensor.calibrate_offset();
+    esp_task_wdt_reset(); 
 
     pixel.setPixelColor(0, pixel.Color(0, 255, 0));
     pixel.show();
