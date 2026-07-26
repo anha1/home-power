@@ -136,12 +136,7 @@ void loop() {
     double current_offset = powerSensor.get_dc_offset();
 
     if (samples > 0) {
-        // 2. Fire the mathematical prime heartbeat
         uint16_t hue = samples * 1979; 
-
-        // ColorHSV(hue, saturation, value)
-        // 255 saturation = full color vibrancy
-        // 255 value = maximum brightness
         uint32_t rgbColor = pixel.ColorHSV(hue, 255, 255);
 
         pixel.setPixelColor(0, rgbColor);
