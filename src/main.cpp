@@ -20,14 +20,14 @@
 
 // --- CONFIGURATION ---
 const int NEOPIXEL_PIN = 21;            
-const int ADC_MAX = 4095;                 
+              
 const unsigned long SUBMIT_INTERVAL_MS = 5000;
 
 WiFiUDP udp;
 Adafruit_NeoPixel pixel(1, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 // Initialize the library with your hardware profile:
-// SilkyRMS(PIN, ADC_BITS, V_REF, VOLTS_TO_AMPS, AC_VOLTAGE)
-SilkyRMS powerSensor(4, 12, 3.3, 30.0, 230.0);
+// SilkyRMS(ADC_BITS, V_REF, VOLTS_TO_AMPS, AC_VOLTAGE)
+SilkyRMS powerSensor(12, 3.3, 30.0, 230.0);
 
 const char* ssid = WIFI_SSID;
 const char* password = WIFI_PASSWORD;
@@ -118,7 +118,7 @@ void setup() {
 
 
     esp_task_wdt_reset(); 
-    powerSensor.begin();
+    powerSensor.begin_adc_native(1);
     powerSensor.calibrate_offset();
     esp_task_wdt_reset(); 
 
@@ -130,18 +130,21 @@ void loop() {
     double power_w = 0.0;
     double irms = 0.0;
 
-    // Block and measure for 5 seconds. The library populates the variables via pointers.
-    powerSensor.run(5000, &power_w, &irms);
+    powerSensor.run(3000, &power_w, &irms);
 
     uint32_t samples = powerSensor.get_last_sample_count();
     double current_offset = powerSensor.get_dc_offset();
 
     if (samples > 0) {
         // 2. Fire the mathematical prime heartbeat
-        uint8_t r = (samples * 197) % 251;
-        uint8_t g = (samples * 311) % 251;
-        uint8_t b = (samples * 439) % 251;
-        pixel.setPixelColor(0, pixel.Color(r, g, b));
+        uint16_t hue = samples * 1979; 
+
+        // ColorHSV(hue, saturation, value)
+        // 255 saturation = full color vibrancy
+        // 255 value = maximum brightness
+        uint32_t rgbColor = pixel.ColorHSV(hue, 255, 255);
+
+        pixel.setPixelColor(0, rgbColor);
         pixel.show();
 
 
@@ -164,4 +167,5 @@ void loop() {
         pixel.setPixelColor(0, pixel.Color(255, 0, 0));
         pixel.show();
     }
-}
+    delay (1000);
+} 
