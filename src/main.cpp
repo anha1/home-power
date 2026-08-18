@@ -34,7 +34,6 @@ int pzem_fail_count = 0;
 int pzem_fail_state = 0;
 
 #include <cmath>
-
 class DynamicCalibrator {
 private:
     float k;
@@ -50,26 +49,69 @@ private:
     float certainty;           
     float cert_alpha;          
 
-    // -- AC/DC Split Variables --
+    // -- AC/DC and Variance Trackers --
     bool is_initialized;
     float b_ema;
     float a_ema;
     float signal_ema_alpha; 
+    
+    float b_var_ema;        
+    float variance_scale;   
 
 public:
-    DynamicCalibrator(float initial_k = 1.02f, float initial_offset = -130.0f,
-                      float lr_k_slow = 1e-7f, float lr_offset_slow = 1e-4f, 
-                      float lr_k_fast = 1e-5f, 
-                      float lr_offset_fast = 0.5f, // CRANKED UP: Snaps DC gap in ~4 ticks when uncertain
-                      float tight_error_scale = 30.0f, 
-                      float certainty_learning_rate = 0.05f,
-                      float baseline_memory = 0.01f)
-        : k(initial_k), offset(initial_offset), 
-          alpha_k_base(lr_k_slow), alpha_offset_base(lr_offset_slow),
-          alpha_k_fast(lr_k_fast), alpha_offset_fast(lr_offset_fast),
-          soft_threshold(tight_error_scale), 
-          certainty(0.0f), cert_alpha(certainty_learning_rate),
-          is_initialized(false), b_ema(0.0f), a_ema(0.0f), signal_ema_alpha(baseline_memory) {}
+    DynamicCalibrator(
+        // --- STARTING CONDITIONS ---
+        // The baseline slope. Kept tightly clamped between 0.8 and 1.2.
+        float initial_k = 1.03f, 
+        
+        // The baseline shift. 
+        float initial_offset = 135.0f,
+        
+        // --- STEADY-STATE LEARNING (High Certainty) ---
+        // How fast K adapts when the system is fully confident.
+        // Kept incredibly small so it doesn't drift on minor noise.
+        float lr_k_slow = 1e-7f, 
+        
+        // How fast the offset adapts when the system is fully confident.
+        // Just enough to track slow thermal drift or component aging.
+        float lr_offset_slow = 1e-4f, 
+        
+        // --- PANIC LEARNING (Low Certainty) ---
+        // How fast K snaps to a new slope when a spike hits and the system realizes it's wrong.
+        float lr_k_fast = 5e-6f, 
+        
+        // How fast the offset closes a huge baseline gap when certainty is zero (e.g., at boot).
+        // 0.05 closes gaps smoothly in about ~20 ticks without oscillating.
+        float lr_offset_fast = 0.05f, 
+        
+        // --- REALITY CHECK PARAMS ---
+        // The boundary (in Watts) of what is considered "normal noise" vs "we are wrong".
+        // If error > 30W, the system starts losing certainty.
+        float tight_error_scale = 30.0f, 
+        
+        // How fast the system gains or loses trust in itself (EMA alpha).
+        // 0.05 means it takes roughly ~20 readings (100 seconds) to fully change its mind.
+        float certainty_learning_rate = 0.05f,
+        
+        // --- SIGNAL KINEMATICS ---
+        // How stubborn the DC baseline tracker is. 
+        // 0.005 means the baseline is an average of the last ~200 readings (~16 mins). 
+        // A 1-minute microwave spike won't drag the baseline up.
+        float baseline_memory = 0.005f,
+        
+        // The mathematical trigger for "Excitation". 
+        // Variance is roughly (Watts spike)^2. 
+        // 5000 means a sudden ~70W swing will wake up K's learning rate. 
+        // If your power is spikier by nature, raise this so it only wakes up for big events.
+        float excitation_variance_scale = 5000.0f
+    ) 
+    : k(initial_k), offset(initial_offset), 
+      alpha_k_base(lr_k_slow), alpha_offset_base(lr_offset_slow),
+      alpha_k_fast(lr_k_fast), alpha_offset_fast(lr_offset_fast),
+      soft_threshold(tight_error_scale), 
+      certainty(0.0f), cert_alpha(certainty_learning_rate),
+      is_initialized(false), b_ema(0.0f), a_ema(0.0f), signal_ema_alpha(baseline_memory),
+      b_var_ema(0.0f), variance_scale(excitation_variance_scale) {}
 
     float predict(float b_raw) const {
         return (k * b_raw) - offset;
@@ -80,50 +122,57 @@ public:
             return false;
         }
 
-        // Initialize the baseline trackers
         if (!is_initialized) {
             b_ema = b_raw;
             a_ema = a_val;
             is_initialized = true;
-        } else {
-            // Track the DC baseline
-            b_ema = (1.0f - signal_ema_alpha) * b_ema + (signal_ema_alpha * b_raw);
-            a_ema = (1.0f - signal_ema_alpha) * a_ema + (signal_ema_alpha * a_val);
         }
 
-        float current_prediction = predict(b_raw);
-        float error = a_val - current_prediction;
+        // 1. TRACK KINEMATICS
+        b_ema = (1.0f - signal_ema_alpha) * b_ema + (signal_ema_alpha * b_raw);
+        a_ema = (1.0f - signal_ema_alpha) * a_ema + (signal_ema_alpha * a_val);
 
-        // 1. REALITY CHECK
-        float objective_error_ratio = error / soft_threshold;
-        float objective_weight = 1.0f / (1.0f + (objective_error_ratio * objective_error_ratio));
-        certainty = (1.0f - cert_alpha) * certainty + (cert_alpha * objective_weight);
-
-        // 2. DYNAMIC LEARNING RATES
-        float current_alpha_k = alpha_k_base + (alpha_k_fast - alpha_k_base) * (1.0f - certainty);
-        float current_alpha_offset = alpha_offset_base + (alpha_offset_fast - alpha_offset_base) * (1.0f - certainty);
-
-        // 3. LEARNING GATE
-        float learning_error_ratio = (error * certainty) / soft_threshold;
-        float learning_weight = 1.0f / (1.0f + (learning_error_ratio * learning_error_ratio));
-        
-        // 4. KINEMATICS (AC/DC Split)
-        
-        // DC Update for Offset
-        float effective_error = error * learning_weight;
-        offset -= current_alpha_offset * effective_error; 
-
-        // AC Update for K
         float b_ac = b_raw - b_ema;
         float a_ac = a_val - a_ema;
+
+        b_var_ema = (1.0f - signal_ema_alpha) * b_var_ema + (signal_ema_alpha * (b_ac * b_ac));
+
+        // 2. THE EXCITATION MEASURE (0.0 to 1.0)
+        float excitation = b_var_ema / (b_var_ema + variance_scale);
+
+        // 3. REALITY CHECK & EPISTEMIC LATCH 
+        float error_inst = a_val - predict(b_raw);
+        float objective_error_ratio = error_inst / soft_threshold;
         
+        float accuracy_weight = 1.0f / (1.0f + (objective_error_ratio * objective_error_ratio));
+        float objective_target = accuracy_weight * (excitation + (1.0f - excitation) * certainty);
+        
+        certainty = (1.0f - cert_alpha) * certainty + (cert_alpha * objective_target);
+
+        // 4. DYNAMIC LEARNING RATES (Certainty based)
+        float dyn_alpha_k = alpha_k_base + (alpha_k_fast - alpha_k_base) * (1.0f - certainty);
+        float dyn_alpha_offset = alpha_offset_base + (alpha_offset_fast - alpha_offset_base) * (1.0f - certainty);
+
+        // 5. EXCITATION DECOUPLING (The Fix)
+        // If excitation is 1.0 (spike), offset learning drops to 0.0.
+        // If excitation is 0.0 (steady), K learning drops to 0.0.
+        float current_alpha_offset = dyn_alpha_offset * (1.0f - excitation);
+        float current_alpha_k      = dyn_alpha_k * excitation;
+
+        // 6. APPLY DECOUPLED AC/DC LEARNING
+        float error_dc = a_ema - predict(b_ema);
+        float learning_ratio_dc = (error_dc * certainty) / soft_threshold;
+        float learning_weight_dc = 1.0f / (1.0f + (learning_ratio_dc * learning_ratio_dc));
+        
+        offset -= current_alpha_offset * (error_dc * learning_weight_dc);
+
         float error_ac = a_ac - (k * b_ac); 
-        float effective_error_ac = error_ac * learning_weight;
+        float learning_ratio_ac = (error_ac * certainty) / soft_threshold;
+        float learning_weight_ac = 1.0f / (1.0f + (learning_ratio_ac * learning_ratio_ac));
 
-        k += current_alpha_k * effective_error_ac * b_ac;
+        k += current_alpha_k * (error_ac * learning_weight_ac) * b_ac;
 
-        // 5. HARD LIMITS
-        // Clamp K firmly between 0.8 and 1.2
+        // Clamp K firmly between 0.8 and 1.2 to prevent catastrophic drift
         k = std::max(0.8f, std::min(1.2f, k));
 
         return true;
@@ -131,6 +180,7 @@ public:
 
     void force_unlock() {
         certainty = 0.0f;
+        b_var_ema = 0.0f; 
     }
 
     float get_k() const { return k; }
