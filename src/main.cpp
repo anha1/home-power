@@ -33,162 +33,6 @@ const unsigned long SUBMIT_INTERVAL_MS = 5000;
 int pzem_fail_count = 0;
 int pzem_fail_state = 0;
 
-#include <cmath>
-class DynamicCalibrator {
-private:
-    float k;
-    float offset;
-    
-    float alpha_k_base;
-    float alpha_offset_base;
-    float alpha_k_fast;
-    float alpha_offset_fast;
-
-    float soft_threshold;
-
-    float certainty;           
-    float cert_alpha;          
-
-    // -- AC/DC and Variance Trackers --
-    bool is_initialized;
-    float b_ema;
-    float a_ema;
-    float signal_ema_alpha; 
-    
-    float b_var_ema;        
-    float variance_scale;   
-
-public:
-    DynamicCalibrator(
-        // --- STARTING CONDITIONS ---
-        // The baseline slope. Kept tightly clamped between 0.8 and 1.2.
-        float initial_k = 1.03f, 
-        
-        // The baseline shift. 
-        float initial_offset = 135.0f,
-        
-        // --- STEADY-STATE LEARNING (High Certainty) ---
-        // How fast K adapts when the system is fully confident.
-        // Kept incredibly small so it doesn't drift on minor noise.
-        float lr_k_slow = 1e-7f, 
-        
-        // How fast the offset adapts when the system is fully confident.
-        // Just enough to track slow thermal drift or component aging.
-        float lr_offset_slow = 1e-4f, 
-        
-        // --- PANIC LEARNING (Low Certainty) ---
-        // How fast K snaps to a new slope when a spike hits and the system realizes it's wrong.
-        float lr_k_fast = 5e-6f, 
-        
-        // How fast the offset closes a huge baseline gap when certainty is zero (e.g., at boot).
-        // 0.05 closes gaps smoothly in about ~20 ticks without oscillating.
-        float lr_offset_fast = 0.05f, 
-        
-        // --- REALITY CHECK PARAMS ---
-        // The boundary (in Watts) of what is considered "normal noise" vs "we are wrong".
-        // If error > 30W, the system starts losing certainty.
-        float tight_error_scale = 30.0f, 
-        
-        // How fast the system gains or loses trust in itself (EMA alpha).
-        // 0.05 means it takes roughly ~20 readings (100 seconds) to fully change its mind.
-        float certainty_learning_rate = 0.05f,
-        
-        // --- SIGNAL KINEMATICS ---
-        // How stubborn the DC baseline tracker is. 
-        // 0.005 means the baseline is an average of the last ~200 readings (~16 mins). 
-        // A 1-minute microwave spike won't drag the baseline up.
-        float baseline_memory = 0.005f,
-        
-        // The mathematical trigger for "Excitation". 
-        // Variance is roughly (Watts spike)^2. 
-        // 5000 means a sudden ~70W swing will wake up K's learning rate. 
-        // If your power is spikier by nature, raise this so it only wakes up for big events.
-        float excitation_variance_scale = 5000.0f
-    ) 
-    : k(initial_k), offset(initial_offset), 
-      alpha_k_base(lr_k_slow), alpha_offset_base(lr_offset_slow),
-      alpha_k_fast(lr_k_fast), alpha_offset_fast(lr_offset_fast),
-      soft_threshold(tight_error_scale), 
-      certainty(0.0f), cert_alpha(certainty_learning_rate),
-      is_initialized(false), b_ema(0.0f), a_ema(0.0f), signal_ema_alpha(baseline_memory),
-      b_var_ema(0.0f), variance_scale(excitation_variance_scale) {}
-
-    float predict(float b_raw) const {
-        return (k * b_raw) - offset;
-    }
-
-    bool update(float b_raw, float a_val) {
-        if (std::isnan(b_raw) || std::isnan(a_val)) {
-            return false;
-        }
-
-        if (!is_initialized) {
-            b_ema = b_raw;
-            a_ema = a_val;
-            is_initialized = true;
-        }
-
-        // 1. TRACK KINEMATICS
-        b_ema = (1.0f - signal_ema_alpha) * b_ema + (signal_ema_alpha * b_raw);
-        a_ema = (1.0f - signal_ema_alpha) * a_ema + (signal_ema_alpha * a_val);
-
-        float b_ac = b_raw - b_ema;
-        float a_ac = a_val - a_ema;
-
-        b_var_ema = (1.0f - signal_ema_alpha) * b_var_ema + (signal_ema_alpha * (b_ac * b_ac));
-
-        // 2. THE EXCITATION MEASURE (0.0 to 1.0)
-        float excitation = b_var_ema / (b_var_ema + variance_scale);
-
-        // 3. REALITY CHECK & EPISTEMIC LATCH 
-        float error_inst = a_val - predict(b_raw);
-        float objective_error_ratio = error_inst / soft_threshold;
-        
-        float accuracy_weight = 1.0f / (1.0f + (objective_error_ratio * objective_error_ratio));
-        float objective_target = accuracy_weight * (excitation + (1.0f - excitation) * certainty);
-        
-        certainty = (1.0f - cert_alpha) * certainty + (cert_alpha * objective_target);
-
-        // 4. DYNAMIC LEARNING RATES (Certainty based)
-        float dyn_alpha_k = alpha_k_base + (alpha_k_fast - alpha_k_base) * (1.0f - certainty);
-        float dyn_alpha_offset = alpha_offset_base + (alpha_offset_fast - alpha_offset_base) * (1.0f - certainty);
-
-        // 5. EXCITATION DECOUPLING (The Fix)
-        // If excitation is 1.0 (spike), offset learning drops to 0.0.
-        // If excitation is 0.0 (steady), K learning drops to 0.0.
-        float current_alpha_offset = dyn_alpha_offset * (1.0f - excitation);
-        float current_alpha_k      = dyn_alpha_k * excitation;
-
-        // 6. APPLY DECOUPLED AC/DC LEARNING
-        float error_dc = a_ema - predict(b_ema);
-        float learning_ratio_dc = (error_dc * certainty) / soft_threshold;
-        float learning_weight_dc = 1.0f / (1.0f + (learning_ratio_dc * learning_ratio_dc));
-        
-        offset -= current_alpha_offset * (error_dc * learning_weight_dc);
-
-        float error_ac = a_ac - (k * b_ac); 
-        float learning_ratio_ac = (error_ac * certainty) / soft_threshold;
-        float learning_weight_ac = 1.0f / (1.0f + (learning_ratio_ac * learning_ratio_ac));
-
-        k += current_alpha_k * (error_ac * learning_weight_ac) * b_ac;
-
-        // Clamp K firmly between 0.8 and 1.2 to prevent catastrophic drift
-        k = std::max(0.8f, std::min(1.2f, k));
-
-        return true;
-    }
-
-    void force_unlock() {
-        certainty = 0.0f;
-        b_var_ema = 0.0f; 
-    }
-
-    float get_k() const { return k; }
-    float get_offset() const { return offset; }
-    float get_certainty() const { return certainty; }
-};
-
-DynamicCalibrator calibrator;
 WiFiUDP udp;
 Adafruit_NeoPixel pixel(1, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 // Initialize the library with your hardware profile:
@@ -329,25 +173,23 @@ void setup() {
 void loop() {
     double power_w = 0.0;
     double irms = 0.0;
+    char statsd_buffer[1024] = "";
 
     delay(4000);
+    pixel.setPixelColor(0, pixel.Color(0, 0, 0));
+    pixel.show();
     powerSensor.run(1000, &power_w, &irms);
 
     uint32_t samples = powerSensor.get_last_sample_count();
     double current_offset = powerSensor.get_dc_offset();
 
-
-    uint16_t hue = samples * 1979; 
-    uint32_t rgbColor = pixel.ColorHSV(hue, 255, 255);
-    pixel.setPixelColor(0, pixel.Color(0, 0, 255));
-    //pixel.setPixelColor(0, rgbColor);
-    pixel.show();
-
-    char statsd_buffer[1024] = "";
-
     // 1. SilkyRMS power sensor metrics (if samples > 0)
     if (samples > 0) {
-        
+        float power_w_calibrated = 1.02 * power_w - 131.;
+        if (power_w_calibrated < 0) power_w_calibrated = 0;
+        add_statsd_metric(statsd_buffer, sizeof(statsd_buffer), "esp32.power.watts_raw", power_w);
+        add_statsd_metric(statsd_buffer, sizeof(statsd_buffer), "esp32.power.watts", power_w_calibrated);
+
         //add_statsd_metric(statsd_buffer, sizeof(statsd_buffer), "esp32.power.amps", irms);
         //add_statsd_metric(statsd_buffer, sizeof(statsd_buffer), "esp32.power.samples", (float)samples);
         //add_statsd_metric(statsd_buffer, sizeof(statsd_buffer), "esp32.power.midpoint", current_offset);
@@ -373,7 +215,7 @@ void loop() {
         if (pzem_fail_count % 7 == 0) {
             tryRecoverUART(false);
         }
-        pixel.setPixelColor(0, pixel.Color(255, 0, 0));
+        pixel.setPixelColor(0, pixel.Color(255, 255, 0));
         pixel.show();
     } else {
         if (pzem_fail_state > 0) pzem_fail_state--;
@@ -382,20 +224,9 @@ void loop() {
         if (!isnan(pzem_frequency)) add_statsd_metric(statsd_buffer, sizeof(statsd_buffer), "esp32.pzem.frequency", pzem_frequency);
         if (!isnan(pzem_pf))        add_statsd_metric(statsd_buffer, sizeof(statsd_buffer), "esp32.pzem.pf", pzem_pf);
 
-        // 1. Update calibration if Sensor A is healthy
-        calibrator.update(power_w, pzem_power);
-
-
-        pixel.setPixelColor(0, pixel.Color(0, 255, 255));
+        pixel.setPixelColor(0, pixel.Color(0, 255, 0));
         pixel.show();
     }
-
-    float power_w_calibrated = calibrator.predict(power_w);
-    if (power_w_calibrated < 0) power_w_calibrated = 0;
-    add_statsd_metric(statsd_buffer, sizeof(statsd_buffer), "esp32.power.watts", power_w_calibrated);
-    add_statsd_metric(statsd_buffer, sizeof(statsd_buffer), "esp32.calibrator.k", calibrator.get_k());
-    add_statsd_metric(statsd_buffer, sizeof(statsd_buffer), "esp32.calibrator.offset", calibrator.get_offset());
-    add_statsd_metric(statsd_buffer, sizeof(statsd_buffer), "esp32.calibrator.certainty", calibrator.get_certainty());
 
     add_statsd_metric(statsd_buffer, sizeof(statsd_buffer), "esp32.pzem.fail", (float)pzem_fail_state);
 
@@ -406,8 +237,6 @@ void loop() {
     // 5. Cleanup, Reset WDT, and go dark for the next measurement cycle
     if (WiFi.status() == WL_CONNECTED && pzem_fail_count < 32) {
         esp_task_wdt_reset(); 
-        pixel.setPixelColor(0, pixel.Color(0, 0, 0));
-        pixel.show();
     } else {
         pixel.setPixelColor(0, pixel.Color(255, 0, 0));
         pixel.show();
