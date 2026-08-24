@@ -185,7 +185,7 @@ void loop() {
 
     // 1. SilkyRMS power sensor metrics (if samples > 0)
     if (samples > 0) {
-        float power_w_calibrated = 1.02 * power_w - 131.;
+        float power_w_calibrated = 1.02 * power_w - 100.;
         if (power_w_calibrated < 0) power_w_calibrated = 0;
         add_statsd_metric(statsd_buffer, sizeof(statsd_buffer), "esp32.power.watts_raw", power_w);
         add_statsd_metric(statsd_buffer, sizeof(statsd_buffer), "esp32.power.watts", power_w_calibrated);
@@ -198,8 +198,11 @@ void loop() {
     }
 
     // 2. Telemetry & uptime (independent of SilkyRMS samples)
+    float nowf = millis();
+    float uptime = log10(nowf) * 10.0;
+
     add_statsd_metric(statsd_buffer, sizeof(statsd_buffer), "esp32.power.wifi_rssi", abs(WiFi.RSSI()));
-    add_statsd_metric(statsd_buffer, sizeof(statsd_buffer), "esp32.power.uptime", 10000 * log(millis()));
+    add_statsd_metric(statsd_buffer, sizeof(statsd_buffer), "esp32.power.uptime", uptime);
 
 
     float pzem_voltage = pzem.voltage();
