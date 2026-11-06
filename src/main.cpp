@@ -162,7 +162,8 @@ void setup() {
     tryRecoverUART(true);
 
     esp_task_wdt_reset(); 
-    powerSensor.begin_adc_native(4);
+    powerSensor.begin_adc_continuous(4, 40000);
+    //powerSensor.begin_adc_native(4);
     powerSensor.calibrate_offset();
     esp_task_wdt_reset(); 
 
